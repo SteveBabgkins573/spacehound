@@ -61,17 +61,39 @@ fn anim_hand(count: usize) {
     println!();
 }
 
-fn play_animation(lang: Lang) {
+/// Возвращает выбранный тип анимации: 1=попугай, 2=бегунок, 3=рука, 0=нет.
+fn choose_animation(lang: Lang) -> u8 {
     println!("\n{}", lang.t("Выберите анимацию загрузки:", "Choose a loading animation:"));
     println!("  1 — 🦜 {}", lang.t("Попугай", "Parrot"));
     println!("  2 — 🏃 {}", lang.t("Бегущий человечек", "Running man"));
     println!("  3 — 🤚 {}", lang.t("Двигающаяся рука", "Moving hand"));
     println!("  4 — {}", lang.t("Без анимации", "No animation"));
-    let c = prompt("> ");
-    match c.as_str() {
-        "1" => anim_parrot(16),
-        "2" => anim_runner(16),
-        "3" => anim_hand(12),
+    loop {
+        match prompt("> ").as_str() {
+            "1" => return 1,
+            "2" => return 2,
+            "3" => return 3,
+            "4" | "" => return 0,
+            _ => println!("Введите 1-4 / Enter 1-4"),
+        }
+    }
+}
+
+fn play_animation(kind: u8) {
+    match kind {
+        1 => anim_parrot(16),
+        2 => anim_runner(16),
+        3 => anim_hand(12),
+        _ => {}
+    }
+}
+
+/// Короткая анимация во время сканирования (respects выбор).
+fn scan_animation(kind: u8) {
+    match kind {
+        1 => anim_parrot(12),
+        2 => anim_runner(12),
+        3 => anim_hand(8),
         _ => {}
     }
 }
@@ -127,7 +149,7 @@ fn choose_lang() -> Lang {
 }
 
 fn greeting(lang: Lang) {
-    println!("\n🦫  SpaceHound 0.5 — {}", lang.t("умный поиск больших файлов", "smart large-file finder"));
+    println!("\n🦫  SpaceHound 0.6 — {}", lang.t("умный поиск больших файлов", "smart large-file finder"));
     println!("{}", lang.t(
         "Сканирую диск, нахожу самое большое и предупреждаю о лишнем.\nНичего не удаляется без подтверждения — всё уходит в резервную копию.",
         "Scans your disk, finds the largest files and warns about junk.\nNothing is deleted without confirmation — everything goes to a backup."
@@ -177,7 +199,20 @@ fn backup_file(path: &Path, lang: Lang) -> bool {
         println!("❌ {}", lang.t("не удалось создать папку бэкапа", "could not create backup dir"));
         return false;
     }
-    let dest = bdir.join(path.file_name().unwrap_or_default());
+    // Защита от перезаписи: если файл с таким именем уже есть в бэкапе,
+    // добавляем суффикс _1, _2 и т.д., чтобы не потерять предыдущий.
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let mut dest = bdir.join(&name);
+    if dest.exists() {
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        let mut i = 1;
+        loop {
+            dest = bdir.join(format!("{}_{}{}", stem, i, ext));
+            if !dest.exists() { break; }
+            i += 1;
+        }
+    }
     match fs::rename(path, &dest) {
         Ok(_) => { println!("   ✅ {} → {}", lang.t("перемещено в бэкап", "moved to backup"), dest.display()); true }
         Err(e) => {
@@ -194,9 +229,9 @@ fn backup_file(path: &Path, lang: Lang) -> bool {
 }
 
 /// Возвращает (продолжить?, выбранный_путь, повторить_тот_же?).
-fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: usize) -> (bool, Option<String>, bool) {
-    println!("\n{} {} {}/{}",
-        lang.t("Попытка сканирования:", "Scan attempt:"), attempt, "/", MAX_ATTEMPTS);
+fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: usize, anim_kind: u8) -> (bool, Option<String>, bool, bool) {
+    println!("\n{} {}/{}",
+        lang.t("Попытка сканирования:", "Scan attempt:"), attempt, MAX_ATTEMPTS);
 
     let root = if let Some(p) = path_override {
         p.to_string()
@@ -214,12 +249,12 @@ fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: 
     let path = Path::new(&root);
     if !path.exists() {
         println!("❌ {}: {}", lang.t("путь не найден", "path not found"), root);
-        return (true, Some(root), false);
+        return (true, Some(root), false, false);
     }
 
     println!("\n🔍 {} {} ...", lang.t("Сканирую", "Scanning"), root);
-    // анимация во время сканирования
-    anim_parrot(12);
+    // анимация во время сканирования (respects выбор пользователя)
+    scan_animation(anim_kind);
 
     let start = std::time::Instant::now();
     let mut files = Vec::new();
@@ -239,7 +274,11 @@ fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: 
         if reason.is_some() { suspicious.push(f.clone()); }
         println!("{:<5} {:<13} {:<45} {}", i + 1, human_size(f.size), {
             let s = f.path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if s.len() > 44 { format!("{}...", &s[..42]) } else { s }
+            // Безопасный срез по символам (не по байтам) — не ломает UTF-8
+            if s.chars().count() > 44 {
+                let truncated: String = s.chars().take(42).collect();
+                format!("{}...", truncated)
+            } else { s }
         }, reason.clone().unwrap_or_default());
     }
 
@@ -271,7 +310,7 @@ fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: 
             "Сканирование окончательно завершено, повторите еще раз spacehound чтобы просканировать еще раз.",
             "Scanning is finally complete, run spacehound again to scan once more."
         ));
-        return (false, Some(root), false);
+        return (false, Some(root), false, false);
     }
 
     // Кнопка «вернуться» + выбор продолжения
@@ -281,10 +320,11 @@ fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: 
         "\nScan again? (Enter=exit, 1=same path, 2=different path, 3=back): "
     ));
     match again.as_str() {
-        "1" => (true, Some(root), true),
-        "2" => (true, Some(root), false),
-        "3" => { greeting(lang); play_animation(lang); (true, None, false) }
-        _ => (false, Some(root), false),
+        "1" => (true, Some(root), true, false),
+        "2" => (true, Some(root), false, false),
+        // «вернуться» — сигнал сбросить счётчик попыток (4-й элемент = true)
+        "3" => { greeting(lang); (true, None, false, true) }
+        _ => (false, Some(root), false, false),
     }
 }
 
@@ -295,13 +335,14 @@ fn main() {
         default_hook(info);
     }));
 
-    let lang = if env::args().len() == 1 {
+    let (lang, anim_kind) = if env::args().len() == 1 {
         greeting(Lang::Ru);
         let l = choose_lang();
         greeting(l);
-        play_animation(l);
-        l
-    } else if env::args().any(|a| a == "--ru") { Lang::Ru } else { Lang::En };
+        let ak = choose_animation(l);
+        play_animation(ak);
+        (l, ak)
+    } else if env::args().any(|a| a == "--ru") { (Lang::Ru, 0) } else { (Lang::En, 0) };
 
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -317,10 +358,15 @@ fn main() {
     let mut attempt = 1;
     loop {
         let override_path: Option<&str> = if repeat_same { remembered.as_deref() } else { None };
-        let (cont, chosen, again_same) = scan_once(lang, &args, override_path, attempt);
+        let (cont, chosen, again_same, reset_attempts) =
+            scan_once(lang, &args, override_path, attempt, anim_kind);
         if let Some(p) = chosen { remembered = Some(p); }
         if !cont { break; }
         repeat_same = again_same;
-        attempt += 1;
+        if reset_attempts {
+            attempt = 1; // «вернуться» начать сначала
+        } else {
+            attempt += 1;
+        }
     }
 }
