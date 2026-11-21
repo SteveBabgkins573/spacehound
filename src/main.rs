@@ -25,7 +25,7 @@ impl Lang {
 
 const MAX_ATTEMPTS: usize = 4;
 
-// ─── АНИМАЦИИ ────────────────────────────────────────────────
+// АНИМАЦИИ
 fn anim_parrot(count: usize) {
     let frames = [
         r"  (\__/)   osc",
@@ -76,7 +76,7 @@ fn play_animation(lang: Lang) {
     }
 }
 
-// ─── ВСПОМОГАТЕЛЬНОЕ ─────────────────────────────────────────
+// ВСПОМОГАТЕЛЬНОЕ
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
@@ -127,12 +127,14 @@ fn choose_lang() -> Lang {
 }
 
 fn greeting(lang: Lang) {
-    println!("\n========================================================");
-    println!("   🦫  SpaceHound 0.5 — {}", lang.t("умный поиск больших файлов", "smart large-file finder"));
-    println!("========================================================");
+    println!("\n🦫  SpaceHound 0.5 — {}", lang.t("умный поиск больших файлов", "smart large-file finder"));
     println!("{}", lang.t(
         "Сканирую диск, нахожу самое большое и предупреждаю о лишнем.\nНичего не удаляется без подтверждения — всё уходит в резервную копию.",
         "Scans your disk, finds the largest files and warns about junk.\nNothing is deleted without confirmation — everything goes to a backup."
+    ));
+    println!("⚠️  {}", lang.t(
+        "Программа сделана ТОЛЬКО для Linux (Pop!_OS, Ubuntu, Debian и др.). На Windows/macOS не запускается.",
+        "This program is made ONLY for Linux (Pop!_OS, Ubuntu, Debian, etc.). Does not run on Windows/macOS."
     ));
 }
 
@@ -193,8 +195,8 @@ fn backup_file(path: &Path, lang: Lang) -> bool {
 
 /// Возвращает (продолжить?, выбранный_путь, повторить_тот_же?).
 fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: usize) -> (bool, Option<String>, bool) {
-    println!("\n──────── {} {} {}/{} ────────",
-        lang.t("Попытка", "Attempt"), lang.t("сканирования", "scan"), attempt, MAX_ATTEMPTS);
+    println!("\n{} {} {}/{}",
+        lang.t("Попытка сканирования:", "Scan attempt:"), attempt, "/", MAX_ATTEMPTS);
 
     let root = if let Some(p) = path_override {
         p.to_string()
@@ -230,7 +232,6 @@ fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: 
 
     println!("\n✅ {}: {} {:.2?} ({} {})", lang.t("Найдено", "Found"), top.len(), elapsed, errors, lang.t("ошибок", "errors"));
     println!("{:<5} {:<13} {:<45} {}", "№", lang.t("РАЗМЕР", "SIZE"), lang.t("ФАЙЛ", "FILE"), lang.t("КОММЕНТАРИЙ", "NOTE"));
-    println!("{}", "-".repeat(100));
 
     let mut suspicious = Vec::new();
     for (i, f) in top.iter().enumerate() {
