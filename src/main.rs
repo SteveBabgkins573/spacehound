@@ -2,8 +2,9 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 #[derive(Clone)]
 struct FileEntry {
@@ -24,81 +25,8 @@ impl Lang {
 }
 
 const MAX_ATTEMPTS: usize = 4;
+const IGNORE_DIRS: [&str; 8] = ["/proc", "/sys", "/dev", "/run", "/.git", "/node_modules", "/.cache/thumbnails", "/snap"];
 
-// АНИМАЦИИ
-fn anim_parrot(count: usize) {
-    let frames = [
-        r"  (\__/)   osc",
-        r"  (='.'=)  osc",
-        r"  (o_)-(o)  ocl",
-        r"  (='.'=)  sco",
-    ];
-    for i in 0..count {
-        print!("\r🦜 {}", frames[i % frames.len()]);
-        io::stdout().flush().ok();
-        thread::sleep(Duration::from_millis(120));
-    }
-    println!();
-}
-
-fn anim_runner(count: usize) {
-    let frames = ["🏃", "🏃‍♂️", "🏃", "🏃‍♂️"];
-    for i in 0..count {
-        print!("\r{} {}", frames[i % frames.len()], ".".repeat((i % 4) + 1));
-        io::stdout().flush().ok();
-        thread::sleep(Duration::from_millis(120));
-    }
-    println!();
-}
-
-fn anim_hand(count: usize) {
-    let frames = ["🤚", "🖐", "✋", "🖐"];
-    for i in 0..count {
-        print!("\r{} {}", frames[i % frames.len()], ".".repeat((i % 3) + 1));
-        io::stdout().flush().ok();
-        thread::sleep(Duration::from_millis(220));
-    }
-    println!();
-}
-
-/// Возвращает выбранный тип анимации: 1=попугай, 2=бегунок, 3=рука, 0=нет.
-fn choose_animation(lang: Lang) -> u8 {
-    println!("\n{}", lang.t("Выберите анимацию загрузки:", "Choose a loading animation:"));
-    println!("  1 — 🦜 {}", lang.t("Попугай", "Parrot"));
-    println!("  2 — 🏃 {}", lang.t("Бегущий человечек", "Running man"));
-    println!("  3 — 🤚 {}", lang.t("Двигающаяся рука", "Moving hand"));
-    println!("  4 — {}", lang.t("Без анимации", "No animation"));
-    loop {
-        match prompt("> ").as_str() {
-            "1" => return 1,
-            "2" => return 2,
-            "3" => return 3,
-            "4" | "" => return 0,
-            _ => println!("Введите 1-4 / Enter 1-4"),
-        }
-    }
-}
-
-fn play_animation(kind: u8) {
-    match kind {
-        1 => anim_parrot(16),
-        2 => anim_runner(16),
-        3 => anim_hand(12),
-        _ => {}
-    }
-}
-
-/// Короткая анимация во время сканирования (respects выбор).
-fn scan_animation(kind: u8) {
-    match kind {
-        1 => anim_parrot(12),
-        2 => anim_runner(12),
-        3 => anim_hand(8),
-        _ => {}
-    }
-}
-
-// ВСПОМОГАТЕЛЬНОЕ
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
@@ -110,21 +38,82 @@ fn human_size(bytes: u64) -> String {
     format!("{:.2} {}", size, UNITS[unit])
 }
 
-fn walk(dir: &Path, files: &mut Vec<FileEntry>, errors: &mut usize) {
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim().to_uppercase();
+    let (num, mult) = if let Some(v) = s.strip_suffix("GB") { (v, 1024u64 * 1024 * 1024) }
+        else if let Some(v) = s.strip_suffix("MB") { (v, 1024 * 1024) }
+        else if let Some(v) = s.strip_suffix("KB") { (v, 1024) }
+        else { (s.as_str(), 1) };
+    num.trim().parse::<u64>().ok().map(|n| n * mult)
+}
+
+fn should_ignore(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    IGNORE_DIRS.iter().any(|d| s.contains(d))
+}
+
+fn collect_dirs(dir: &Path, dirs: &mut Vec<PathBuf>, errors: &AtomicUsize) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => { *errors += 1; return; }
+        Err(_) => { errors.fetch_add(1, Ordering::Relaxed); return; }
     };
     for entry in entries.flatten() {
         let path = entry.path();
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(_) => { *errors += 1; continue; }
+            Err(_) => { errors.fetch_add(1, Ordering::Relaxed); continue; }
         };
         if meta.file_type().is_symlink() { continue; }
-        if meta.is_dir() { walk(&path, files, errors); }
-        else if meta.is_file() { files.push(FileEntry { path, size: meta.len() }); }
+        if meta.is_dir() {
+            if !should_ignore(&path) {
+                dirs.push(path.clone());
+                collect_dirs(&path, dirs, errors);
+            }
+        }
     }
+}
+
+fn scan_dir(dir: &Path, tx: &mpsc::Sender<FileEntry>, errors: &AtomicUsize) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => { errors.fetch_add(1, Ordering::Relaxed); return; }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => { errors.fetch_add(1, Ordering::Relaxed); continue; }
+        };
+        if meta.file_type().is_symlink() { continue; }
+        if meta.is_file() {
+            let _ = tx.send(FileEntry { path, size: meta.len() });
+        }
+    }
+}
+
+fn parallel_scan(root: &Path) -> (Vec<FileEntry>, usize) {
+    let errors = AtomicUsize::new(0);
+    let mut dirs = Vec::new();
+    collect_dirs(root, &mut dirs, &errors);
+    if !should_ignore(root) { dirs.push(root.to_path_buf()); }
+
+    let threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2);
+    let (tx, rx) = mpsc::channel();
+    let chunk_size = (dirs.len() + threads - 1) / threads;
+
+    thread::scope(|s| {
+        for chunk in dirs.chunks(chunk_size.max(1)) {
+            let tx = tx.clone();
+            let errors = &errors;
+            s.spawn(move || {
+                for dir in chunk { scan_dir(dir, &tx, errors); }
+            });
+        }
+    });
+    drop(tx);
+
+    let files: Vec<FileEntry> = rx.into_iter().collect();
+    (files, errors.load(Ordering::Relaxed))
 }
 
 fn prompt(msg: &str) -> String {
@@ -149,14 +138,14 @@ fn choose_lang() -> Lang {
 }
 
 fn greeting(lang: Lang) {
-    println!("\n🦫  SpaceHound 0.6 — {}", lang.t("умный поиск больших файлов", "smart large-file finder"));
+    println!("\n🦫  SpaceHound 1.0 — {}", lang.t("умный поиск больших файлов", "smart large-file finder"));
     println!("{}", lang.t(
-        "Сканирую диск, нахожу самое большое и предупреждаю о лишнем.\nНичего не удаляется без подтверждения — всё уходит в резервную копию.",
-        "Scans your disk, finds the largest files and warns about junk.\nNothing is deleted without confirmation — everything goes to a backup."
+        "Параллельное сканирование, фильтры, экспорт и безопасный бэкап.\nНичего не удаляется без подтверждения.",
+        "Parallel scan, filters, export and safe backup.\nNothing is deleted without confirmation."
     ));
     println!("⚠️  {}", lang.t(
-        "Программа сделана ТОЛЬКО для Linux (Pop!_OS, Ubuntu, Debian и др.). На Windows/macOS не запускается.",
-        "This program is made ONLY for Linux (Pop!_OS, Ubuntu, Debian, etc.). Does not run on Windows/macOS."
+        "Программа сделана ТОЛЬКО для Linux (Pop!_OS, Ubuntu, Debian и др.).",
+        "This program is made ONLY for Linux (Pop!_OS, Ubuntu, Debian, etc.)."
     ));
 }
 
@@ -199,8 +188,6 @@ fn backup_file(path: &Path, lang: Lang) -> bool {
         println!("❌ {}", lang.t("не удалось создать папку бэкапа", "could not create backup dir"));
         return false;
     }
-    // Защита от перезаписи: если файл с таким именем уже есть в бэкапе,
-    // добавляем суффикс _1, _2 и т.д., чтобы не потерять предыдущий.
     let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
     let mut dest = bdir.join(&name);
     if dest.exists() {
@@ -228,8 +215,19 @@ fn backup_file(path: &Path, lang: Lang) -> bool {
     }
 }
 
-/// Возвращает (продолжить?, выбранный_путь, повторить_тот_же?).
-fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: usize, anim_kind: u8) -> (bool, Option<String>, bool, bool) {
+fn export_report(path: &Path, files: &[FileEntry], lang: Lang) {
+    let mut content = format!("SpaceHound 1.0 — {}\n", lang.t("отчёт", "report"));
+    for (i, f) in files.iter().enumerate() {
+        content.push_str(&format!("{}. {} — {}\n", i + 1, f.path.display(), human_size(f.size)));
+    }
+    if fs::write(path, content).is_ok() {
+        println!("✅ {} → {}", lang.t("Отчёт сохранён", "Report saved"), path.display());
+    } else {
+        println!("❌ {}", lang.t("не удалось сохранить отчёт", "could not save report"));
+    }
+}
+
+fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: usize) -> (bool, Option<String>, bool, bool) {
     println!("\n{} {}/{}",
         lang.t("Попытка сканирования:", "Scan attempt:"), attempt, MAX_ATTEMPTS);
 
@@ -246,27 +244,56 @@ fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: 
         args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(20)
     } else { 20 };
 
+    let min_size = if let Some(i) = args.iter().position(|a| a == "--min") {
+        args.get(i + 1).and_then(|s| parse_size(s)).unwrap_or(0)
+    } else { 0 };
+
+    let ext_filter = if let Some(i) = args.iter().position(|a| a == "--ext") {
+        args.get(i + 1).cloned().unwrap_or_default().to_lowercase()
+    } else { String::new() };
+
+    let export_path = if let Some(i) = args.iter().position(|a| a == "--export") {
+        args.get(i + 1).cloned()
+    } else { None };
+
     let path = Path::new(&root);
     if !path.exists() {
         println!("❌ {}: {}", lang.t("путь не найден", "path not found"), root);
         return (true, Some(root), false, false);
     }
 
-    println!("\n🔍 {} {} ...", lang.t("Сканирую", "Scanning"), root);
-    // анимация во время сканирования (respects выбор пользователя)
-    scan_animation(anim_kind);
-
+    println!("\n🔍 {} {} ...", lang.t("Параллельное сканирование", "Parallel scan"), root);
     let start = std::time::Instant::now();
-    let mut files = Vec::new();
-    let mut errors = 0usize;
-    walk(path, &mut files, &mut errors);
+    let (mut files, errors) = parallel_scan(path);
     let elapsed = start.elapsed();
 
+    let total_found = files.len();
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+
+    files.retain(|f| f.size >= min_size);
+    if !ext_filter.is_empty() {
+        files.retain(|f| f.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase() == ext_filter);
+    }
     files.sort_by(|a, b| b.size.cmp(&a.size));
     let top: Vec<FileEntry> = files.iter().take(n).cloned().collect();
 
-    println!("\n✅ {}: {} {:.2?} ({} {})", lang.t("Найдено", "Found"), top.len(), elapsed, errors, lang.t("ошибок", "errors"));
-    println!("{:<5} {:<13} {:<45} {}", "№", lang.t("РАЗМЕР", "SIZE"), lang.t("ФАЙЛ", "FILE"), lang.t("КОММЕНТАРИЙ", "NOTE"));
+    let mut ext_stats: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for f in &files {
+        let ext = f.path.extension().and_then(|e| e.to_str()).unwrap_or("(нет)").to_lowercase();
+        *ext_stats.entry(ext).or_insert(0) += f.size;
+    }
+    let mut ext_top: Vec<_> = ext_stats.into_iter().collect();
+    ext_top.sort_by(|a, b| b.1.cmp(&a.1));
+    ext_top.truncate(5);
+
+    println!("\n✅ {}: {} {} {:.2?} ({} {})",
+        lang.t("Найдено", "Found"), files.len(), lang.t("файлов за", "files in"), elapsed, errors, lang.t("ошибок", "errors"));
+    println!("{}: {} | {}: {}", lang.t("Всего", "Total"), total_found, lang.t("Суммарно", "Sum"), human_size(total_bytes));
+    println!("{}:", lang.t("Топ расширений", "Top extensions"));
+    for (ext, size) in &ext_top {
+        println!("   .{:<10} {}", ext, human_size(*size));
+    }
+    println!("\n{:<5} {:<13} {:<45} {}", "№", lang.t("РАЗМЕР", "SIZE"), lang.t("ФАЙЛ", "FILE"), lang.t("КОММЕНТАРИЙ", "NOTE"));
 
     let mut suspicious = Vec::new();
     for (i, f) in top.iter().enumerate() {
@@ -274,13 +301,14 @@ fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: 
         if reason.is_some() { suspicious.push(f.clone()); }
         println!("{:<5} {:<13} {:<45} {}", i + 1, human_size(f.size), {
             let s = f.path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            // Безопасный срез по символам (не по байтам) — не ломает UTF-8
             if s.chars().count() > 44 {
                 let truncated: String = s.chars().take(42).collect();
                 format!("{}...", truncated)
             } else { s }
         }, reason.clone().unwrap_or_default());
     }
+
+    if let Some(ep) = export_path { export_report(Path::new(&ep), &top, lang); }
 
     if !suspicious.is_empty() {
         println!("\n⚠️  {}:", lang.t("Рекомендации", "Recommendations"));
@@ -304,7 +332,6 @@ fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: 
         println!("\n{}", lang.t("Подозрительных файлов не найдено. Всё чисто!", "No suspicious files found. All clean!"));
     }
 
-    // Если это была 4-я попытка — завершаем по заданию
     if attempt >= MAX_ATTEMPTS {
         println!("\n{}", lang.t(
             "Сканирование окончательно завершено, повторите еще раз spacehound чтобы просканировать еще раз.",
@@ -313,7 +340,6 @@ fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: 
         return (false, Some(root), false, false);
     }
 
-    // Кнопка «вернуться» + выбор продолжения
     println!("\n{}", lang.t("[Вернуться] — начать сначала", "[Back] — start over"));
     let again = prompt(&lang.t(
         "\nПросканировать ещё раз? (Enter=выход, 1=тот же путь, 2=другой путь, 3=вернуться): ",
@@ -322,7 +348,6 @@ fn scan_once(lang: Lang, args: &[String], path_override: Option<&str>, attempt: 
     match again.as_str() {
         "1" => (true, Some(root), true, false),
         "2" => (true, Some(root), false, false),
-        // «вернуться» — сигнал сбросить счётчик попыток (4-й элемент = true)
         "3" => { greeting(lang); (true, None, false, true) }
         _ => (false, Some(root), false, false),
     }
@@ -335,20 +360,18 @@ fn main() {
         default_hook(info);
     }));
 
-    let (lang, anim_kind) = if env::args().len() == 1 {
+    let lang = if env::args().len() == 1 {
         greeting(Lang::Ru);
         let l = choose_lang();
         greeting(l);
-        let ak = choose_animation(l);
-        play_animation(ak);
-        (l, ak)
-    } else if env::args().any(|a| a == "--ru") { (Lang::Ru, 0) } else { (Lang::En, 0) };
+        l
+    } else if env::args().any(|a| a == "--ru") { Lang::Ru } else { Lang::En };
 
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("\n{}", lang.t(
-            "Использование:\n  spacehound              интерактивный режим\n  spacehound ПУТЬ [-n N]   сканировать папку\n  spacehound ПУТЬ --ru     русский вывод",
-            "Usage:\n  spacehound              interactive mode\n  spacehound PATH [-n N]   scan a folder\n  spacehound PATH --ru     Russian output"
+            "Использование:\n  spacehound                    интерактивный режим\n  spacehound ПУТЬ [-n N]         сканировать папку\n  spacehound ПУТЬ --min 100M     файлы от 100 МБ\n  spacehound ПУТЬ --ext mp4      только .mp4\n  spacehound ПУТЬ --export out.txt  сохранить отчёт\n  spacehound ПУТЬ --ru           русский вывод",
+            "Usage:\n  spacehound                    interactive mode\n  spacehound PATH [-n N]         scan a folder\n  spacehound PATH --min 100M     files from 100 MB\n  spacehound PATH --ext mp4      only .mp4\n  spacehound PATH --export out.txt  save report\n  spacehound PATH --ru           Russian output"
         ));
         return;
     }
@@ -359,14 +382,10 @@ fn main() {
     loop {
         let override_path: Option<&str> = if repeat_same { remembered.as_deref() } else { None };
         let (cont, chosen, again_same, reset_attempts) =
-            scan_once(lang, &args, override_path, attempt, anim_kind);
+            scan_once(lang, &args, override_path, attempt);
         if let Some(p) = chosen { remembered = Some(p); }
         if !cont { break; }
         repeat_same = again_same;
-        if reset_attempts {
-            attempt = 1; // «вернуться» начать сначала
-        } else {
-            attempt += 1;
-        }
+        if reset_attempts { attempt = 1; } else { attempt += 1; }
     }
 }
